@@ -250,6 +250,60 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
     }),
   );
 
+  it.effect("namespaces assistant item ids uniquely when resuming a session", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-resume-item-id-thread");
+
+      const wrapperPath = yield* Effect.promise(() => makeMockAgentWrapper());
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const runtimeEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      // Resuming loads the previous ACP session, so the mock keeps the same
+      // session id while the runtime restarts its segment counter at zero.
+      const session = yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+        resumeCursor: { schemaVersion: 1, sessionId: "mock-session-1" },
+      });
+      assert.deepStrictEqual(session.resumeCursor, {
+        schemaVersion: 1,
+        sessionId: "mock-session-1",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "after resume",
+        attachments: [],
+      });
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const contentDelta = runtimeEvents.find((event) => event.type === "content.delta");
+      assert.isDefined(contentDelta);
+      if (contentDelta?.type === "content.delta") {
+        // A resumed run must not reuse `assistant:<sessionId>:segment:<n>` ids
+        // issued by the pre-restart runtime: message ids derive from item ids,
+        // so reuse silently overwrites previously persisted assistant messages.
+        assert.match(
+          String(contentDelta.itemId),
+          /^assistant:mock-session-1:run:[0-9a-f-]{36}:segment:0$/,
+        );
+      }
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("steers a running turn instead of opening a new one on mid-turn sendTurn", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;

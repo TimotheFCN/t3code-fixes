@@ -1,3 +1,5 @@
+import * as NodeCrypto from "node:crypto";
+
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -278,6 +280,17 @@ export const make = (
     const eventQueue = yield* Queue.unbounded<AcpSessionRuntimeEvent>();
     const modeStateRef = yield* Ref.make<AcpSessionModeState | undefined>(undefined);
     const toolCallsRef = yield* Ref.make(new Map<string, AcpToolCallState>());
+    // Assistant item ids embed the ACP session id and a per-runtime segment
+    // counter. A resumed session (`session/load`) keeps the session id of an
+    // earlier runtime instance while this counter restarts at zero, so resumed
+    // runs would reissue item ids the previous instance already emitted and
+    // downstream consumers keyed by item id would overwrite persisted
+    // assistant messages instead of appending new ones. Namespacing resumed
+    // runs with a unique token keeps item ids unique across process restarts;
+    // fresh sessions keep canonical ids because their session id is new.
+    const assistantItemRunToken = options.resumeSessionId
+      ? yield* Effect.sync(() => NodeCrypto.randomUUID())
+      : undefined;
     const assistantSegmentRef = yield* Ref.make<AcpAssistantSegmentState>({ nextSegmentIndex: 0 });
     const configOptionsRef = yield* Ref.make(sessionConfigOptionsFromSetup(undefined));
     const startStateRef = yield* Ref.make<AcpStartState>({ _tag: "NotStarted" });
@@ -387,6 +400,7 @@ export const make = (
           modeStateRef,
           toolCallsRef,
           assistantSegmentRef,
+          assistantItemRunToken,
           params: notification,
         });
       }),
@@ -834,12 +848,14 @@ const handleSessionUpdate = ({
   modeStateRef,
   toolCallsRef,
   assistantSegmentRef,
+  assistantItemRunToken,
   params,
 }: {
   readonly queue: Queue.Queue<AcpSessionRuntimeEvent>;
   readonly modeStateRef: Ref.Ref<AcpSessionModeState | undefined>;
   readonly toolCallsRef: Ref.Ref<Map<string, AcpToolCallState>>;
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
+  readonly assistantItemRunToken: string | undefined;
   readonly params: EffectAcpSchema.SessionNotification;
 }): Effect.Effect<void> =>
   Effect.gen(function* () {
@@ -886,6 +902,7 @@ const handleSessionUpdate = ({
         const itemId = yield* ensureActiveAssistantSegment({
           queue,
           assistantSegmentRef,
+          assistantItemRunToken,
           sessionId: params.sessionId,
         });
         yield* Queue.offer(queue, {
@@ -924,16 +941,20 @@ function shouldEmitToolCallUpdate(
   return previous === undefined || previous.title !== next.title || previous.detail !== next.detail;
 }
 
-const assistantItemId = (sessionId: string, segmentIndex: number) =>
-  `assistant:${sessionId}:segment:${segmentIndex}`;
+const assistantItemId = (sessionId: string, runToken: string | undefined, segmentIndex: number) =>
+  runToken
+    ? `assistant:${sessionId}:run:${runToken}:segment:${segmentIndex}`
+    : `assistant:${sessionId}:segment:${segmentIndex}`;
 
 const ensureActiveAssistantSegment = ({
   queue,
   assistantSegmentRef,
+  assistantItemRunToken,
   sessionId,
 }: {
   readonly queue: Queue.Queue<AcpSessionRuntimeEvent>;
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
+  readonly assistantItemRunToken: string | undefined;
   readonly sessionId: string;
 }) =>
   Ref.modify<AcpAssistantSegmentState, EnsureActiveAssistantSegmentResult>(
@@ -942,7 +963,7 @@ const ensureActiveAssistantSegment = ({
       if (current.activeItemId) {
         return [{ itemId: current.activeItemId }, current] as const;
       }
-      const itemId = assistantItemId(sessionId, current.nextSegmentIndex);
+      const itemId = assistantItemId(sessionId, assistantItemRunToken, current.nextSegmentIndex);
       return [
         {
           itemId,
