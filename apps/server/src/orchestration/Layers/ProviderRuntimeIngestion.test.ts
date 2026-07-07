@@ -249,6 +249,10 @@ describe("ProviderRuntimeIngestion", () => {
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(ingestion.start().pipe(Scope.provide(scope)));
     const drain = () => Effect.runPromise(ingestion.drain);
+    const readEvents = () =>
+      Effect.runPromise(
+        Stream.runCollect(engine.readEvents(0)).pipe(Effect.map((chunk) => Array.from(chunk))),
+      );
 
     const createdAt = "2026-01-01T00:00:00.000Z";
     await Effect.runPromise(
@@ -315,6 +319,7 @@ describe("ProviderRuntimeIngestion", () => {
       emit: provider.emit,
       setProviderSession: provider.setSession,
       drain,
+      readEvents,
     };
   }
 
@@ -503,6 +508,81 @@ describe("ProviderRuntimeIngestion", () => {
       harness.readModel,
       (thread) => thread.session?.status === "ready" && thread.session?.activeTurnId === null,
     );
+  });
+
+  it("does not restore an interrupted Cursor turn during session recovery", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-interrupted-before-recovery");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-before-cursor-recovery"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+      threadId,
+      turnId,
+    });
+
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.status === "running" && thread.session.activeTurnId === turnId,
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.interrupt",
+        commandId: CommandId.make("cmd-interrupt-before-cursor-recovery"),
+        threadId,
+        turnId,
+        createdAt: "2026-01-01T00:00:02.000Z",
+      }),
+    );
+
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session.activeTurnId === turnId &&
+        thread.latestTurn?.state === "interrupted",
+    );
+
+    // Cursor session/load emits this startup sequence while recovering the
+    // provider session. The interrupt request alone must not mark the session
+    // idle, but the provider's ready state is confirmation that the recovered
+    // session is no longer running the interrupted turn.
+    harness.emit({
+      type: "session.started",
+      eventId: asEventId("evt-cursor-session-started-after-interrupt"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: "2026-01-01T00:00:03.000Z",
+      threadId,
+    });
+    harness.emit({
+      type: "session.state.changed",
+      eventId: asEventId("evt-cursor-session-ready-after-interrupt"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: "2026-01-01T00:00:04.000Z",
+      threadId,
+      payload: {
+        state: "ready",
+        reason: "Cursor ACP session ready",
+      },
+    });
+    harness.emit({
+      type: "thread.started",
+      eventId: asEventId("evt-cursor-thread-started-after-interrupt"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: "2026-01-01T00:00:05.000Z",
+      threadId,
+    });
+
+    await harness.drain();
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === threadId);
+    expect(thread?.session?.status).toBe("ready");
+    expect(thread?.session?.activeTurnId).toBeNull();
+    expect(thread?.latestTurn?.state).not.toBe("running");
   });
 
   it("accepts claude turn lifecycle when seeded thread id is a synthetic placeholder", async () => {
@@ -1938,11 +2018,7 @@ describe("ProviderRuntimeIngestion", () => {
     expect(resumedMessage?.text).toBe(" second half");
     expect(resumedMessage?.streaming).toBe(false);
 
-    const events = await Effect.runPromise(
-      Stream.runCollect(harness.engine.readEvents(0)).pipe(
-        Effect.map((chunk) => Array.from(chunk)),
-      ),
-    );
+    const events = await harness.readEvents();
     const assistantEvents = events.filter(
       (event): event is Extract<(typeof events)[number], { type: "thread.message-sent" }> =>
         event.type === "thread.message-sent" &&
@@ -2294,11 +2370,7 @@ describe("ProviderRuntimeIngestion", () => {
         ),
     );
 
-    const events = await Effect.runPromise(
-      Stream.runCollect(harness.engine.readEvents(0)).pipe(
-        Effect.map((chunk) => Array.from(chunk)),
-      ),
-    );
+    const events = await harness.readEvents();
     const completionEvents = events.filter((event) => {
       if (event.type !== "thread.message-sent") {
         return false;
