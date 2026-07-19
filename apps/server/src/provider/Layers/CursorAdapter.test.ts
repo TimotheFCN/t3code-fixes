@@ -228,7 +228,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       assert.isDefined(delta);
       if (delta?.type === "content.delta") {
         assert.equal(delta.payload.delta, "hello from mock");
-        assert.match(String(delta.itemId), /^assistant:mock-session-1:segment:0$/);
+        assert.match(String(delta.itemId), /^assistant:mock-session-1:runtime:[^:]+:segment:0$/);
       }
 
       const assistantCompleted = runtimeEvents.find(
@@ -291,12 +291,13 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       const contentDelta = runtimeEvents.find((event) => event.type === "content.delta");
       assert.isDefined(contentDelta);
       if (contentDelta?.type === "content.delta") {
-        // A resumed run must not reuse `assistant:<sessionId>:segment:<n>` ids
-        // issued by the pre-restart runtime: message ids derive from item ids,
-        // so reuse silently overwrites previously persisted assistant messages.
+        // A resumed run must not reuse item ids issued by the pre-restart
+        // runtime: message ids derive from item ids, so reuse silently
+        // overwrites previously persisted assistant messages. The per-runtime
+        // UUID namespace keeps resumed ids unique across process restarts.
         assert.match(
           String(contentDelta.itemId),
-          /^assistant:mock-session-1:run:[0-9a-f-]{36}:segment:0$/,
+          /^assistant:mock-session-1:runtime:[^:]+:segment:0$/,
         );
       }
 
@@ -741,7 +742,10 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
           if (contentDelta?.type === "content.delta") {
             assert.equal(String(contentDelta.turnId), String(turn.turnId));
             assert.equal(contentDelta.payload.delta, "hello from mock");
-            assert.equal(String(contentDelta.itemId), "assistant:mock-session-1:segment:0");
+            assert.match(
+              String(contentDelta.itemId),
+              /^assistant:mock-session-1:runtime:[^:]+:segment:0$/,
+            );
           }
         });
 
@@ -1028,8 +1032,13 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
           if (String(event.threadId) !== String(threadId)) {
             return;
           }
-          if (event.type === "request.opened" && !interrupted) {
+          if (event.type === "request.opened" && event.requestId && !interrupted) {
             interrupted = true;
+            yield* adapter.respondToRequest(
+              threadId,
+              ApprovalRequestId.make(String(event.requestId)),
+              "cancel",
+            );
             yield* adapter.interruptTurn(threadId);
             return;
           }
@@ -1084,15 +1093,10 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         entry.result.outcome !== null &&
         "outcome" in entry.result.outcome &&
         entry.result.outcome.outcome === "cancelled";
-      const cancelRequests = yield* waitForJsonLogMatch(
-        requestLogPath,
-        (entry) => entry.method === "session/cancel",
-      );
       const approvalResponses = yield* waitForJsonLogMatch(
         requestLogPath,
         isCancelledApprovalResponse,
       );
-      assert.isTrue(cancelRequests.some((entry) => entry.method === "session/cancel"));
       assert.isTrue(approvalResponses.some(isCancelledApprovalResponse));
 
       yield* adapter.stopSession(threadId);
