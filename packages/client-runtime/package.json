@@ -119,6 +119,10 @@
       "types": "./src/state/terminal.ts",
       "default": "./src/state/terminal.ts"
     },
+    "./state/subagent-tasks": {
+      "types": "./src/state/subagentTasks.ts",
+      "default": "./src/state/subagentTasks.ts"
+    },
     "./state/threads": {
       "types": "./src/state/threads.ts",
       "default": "./src/state/threads.ts"

@@ -18,6 +18,9 @@ const emitInterleavedAssistantToolCalls =
   process.env.T3_ACP_EMIT_INTERLEAVED_ASSISTANT_TOOL_CALLS === "1";
 const emitGenericToolPlaceholders = process.env.T3_ACP_EMIT_GENERIC_TOOL_PLACEHOLDERS === "1";
 const emitAskQuestion = process.env.T3_ACP_EMIT_ASK_QUESTION === "1";
+const emitCursorTask = process.env.T3_ACP_EMIT_CURSOR_TASK === "1";
+const cursorTaskPrompt = process.env.T3_ACP_CURSOR_TASK_PROMPT ?? "Run the mock subagent task.";
+const cursorTaskIsBackground = process.env.T3_ACP_CURSOR_TASK_IS_BACKGROUND !== "0";
 const emitXAiAskUserQuestion = process.env.T3_ACP_EMIT_XAI_ASK_USER_QUESTION === "1";
 const emitXAiPromptCompleteThenHang = process.env.T3_ACP_EMIT_XAI_PROMPT_COMPLETE_THEN_HANG === "1";
 const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATES === "1";
@@ -748,6 +751,54 @@ const program = Effect.gen(function* () {
             rawOutput: {
               content: "package.json\n",
             },
+          },
+        });
+
+        return { stopReason: "end_turn" };
+      }
+
+      if (emitCursorTask) {
+        const toolCallId = "cursor-task-tool-call-1";
+
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId,
+            title: "Task: Subagent task",
+            kind: "other",
+            status: "pending",
+            rawInput: { _toolName: "task" },
+          },
+        });
+
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            status: "completed",
+            rawOutput: { durationMs: 421, isBackground: cursorTaskIsBackground },
+          },
+        });
+
+        // cursor-agent sends cursor/task as a JSON-RPC request expecting an
+        // empty result, despite the docs describing it as a notification.
+        yield* agent.client.extRequest("cursor/task", {
+          toolCallId,
+          description: "Mock subagent task",
+          prompt: cursorTaskPrompt,
+          subagentType: { custom: { unspecified: {} } },
+          model: "mock-model",
+          agentId: "bogus-launch-agent-id",
+          durationMs: 421,
+        });
+
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Launched the subagent in the background." },
           },
         });
 

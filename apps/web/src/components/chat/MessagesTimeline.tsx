@@ -140,6 +140,7 @@ interface TimelineRowActivityState {
   isWorking: boolean;
   isRevertingCheckpoint: boolean;
   activeTurnInProgress: boolean;
+  waitingOnSubagentsCount: number;
 }
 
 const TimelineRowCtx = createContext<TimelineRowSharedState>(null!);
@@ -154,6 +155,8 @@ const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "d
 
 interface MessagesTimelineProps {
   isWorking: boolean;
+  /** Number of background subagents still running while the turn is settled. */
+  waitingOnSubagentsCount?: number;
   activeTurnInProgress: boolean;
   activeTurnStartedAt: string | null;
   listRef: React.RefObject<LegendListRef | null>;
@@ -188,6 +191,7 @@ interface MessagesTimelineProps {
 
 export const MessagesTimeline = memo(function MessagesTimeline({
   isWorking,
+  waitingOnSubagentsCount = 0,
   activeTurnInProgress,
   activeTurnStartedAt,
   listRef,
@@ -444,8 +448,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       isWorking,
       isRevertingCheckpoint,
       activeTurnInProgress,
+      waitingOnSubagentsCount,
     }),
-    [activeTurnInProgress, isRevertingCheckpoint, isWorking],
+    [activeTurnInProgress, isRevertingCheckpoint, isWorking, waitingOnSubagentsCount],
   );
 
   // Stable renderItem — no closure deps. Row components read shared state
@@ -1056,6 +1061,8 @@ function ProposedPlanTimelineRow({
 }
 
 function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "working" }> }) {
+  const activity = use(TimelineRowActivityCtx);
+  const waitingCount = activity?.waitingOnSubagentsCount ?? 0;
   return (
     <div className="py-0.5 pl-1.5">
       <div className="flex items-center gap-2 pt-1 text-[11px] text-muted-foreground/70 tabular-nums">
@@ -1065,7 +1072,13 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
           <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-status-pulse [animation-delay:400ms]" />
         </span>
         <span>
-          {row.createdAt ? (
+          {waitingCount > 0 ? (
+            waitingCount === 1 ? (
+              "Waiting for 1 subagent..."
+            ) : (
+              `Waiting for ${waitingCount} subagents...`
+            )
+          ) : row.createdAt ? (
             <>
               Working for <WorkingTimer createdAt={row.createdAt} />
             </>

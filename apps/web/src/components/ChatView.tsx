@@ -85,6 +85,10 @@ import {
   hasActionableProposedPlan,
   isLatestTurnSettled,
 } from "../session-logic";
+import {
+  deriveSubagentTasks,
+  openBackgroundSubagentTasks,
+} from "@t3tools/client-runtime/state/subagent-tasks";
 import { type LegendListRef } from "@legendapp/list/react";
 import { getAnchoredTurnMetrics, type TimelineScrollMode } from "./chat/timelineScrollAnchoring";
 import {
@@ -137,6 +141,7 @@ import { DiffWorkerPoolProvider } from "./DiffWorkerPoolProvider";
 import { BranchToolbar } from "./BranchToolbar";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import PlanSidebar from "./PlanSidebar";
+import SubagentPanel from "./SubagentPanel";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
 import { ChevronDownIcon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
 import { cn, randomHex } from "~/lib/utils";
@@ -1861,6 +1866,11 @@ function ChatViewContent(props: ChatViewProps) {
   const phase = derivePhase(activeThread?.session ?? null);
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
   const workLogEntries = useMemo(() => deriveWorkLogEntries(threadActivities), [threadActivities]);
+  const subagentTasks = useMemo(() => deriveSubagentTasks(threadActivities), [threadActivities]);
+  const openSubagentTasks = useMemo(
+    () => openBackgroundSubagentTasks(subagentTasks),
+    [subagentTasks],
+  );
   const pendingApprovals = useMemo(
     () => derivePendingApprovals(threadActivities),
     [threadActivities],
@@ -1946,7 +1956,14 @@ function ChatViewContent(props: ChatViewProps) {
     activePendingUserInput: activePendingUserInput?.requestId ?? null,
     threadError,
   });
-  const isWorking = phase === "running" || isSendBusy || isConnecting || isRevertingCheckpoint;
+  const isWaitingOnSubagents =
+    phase === "ready" && !isSendBusy && !isConnecting && openSubagentTasks.length > 0;
+  const isWorking =
+    phase === "running" ||
+    isSendBusy ||
+    isConnecting ||
+    isRevertingCheckpoint ||
+    isWaitingOnSubagents;
   const activeWorkStartedAt = deriveActiveWorkStartedAt(
     activeLatestTurn,
     activeThread?.session ?? null,
@@ -3664,6 +3681,17 @@ function ChatViewContent(props: ChatViewProps) {
     sidebarProposedPlan?.turnId,
   ]);
 
+  // Auto-open the subagent panel the first time background subagents start
+  // running for this thread, so their progress is visible without digging.
+  const subagentPanelAutoOpenedThreadRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (openSubagentTasks.length === 0) return;
+    if (!activeThreadRef || !activeThread?.id) return;
+    if (subagentPanelAutoOpenedThreadRef.current === activeThread.id) return;
+    subagentPanelAutoOpenedThreadRef.current = activeThread.id;
+    useRightPanelStore.getState().open(activeThreadRef, "subagents");
+  }, [activeThread?.id, activeThreadRef, openSubagentTasks.length]);
+
   useEffect(() => {
     setIsRevertingCheckpoint(false);
   }, [activeThread?.id]);
@@ -5173,6 +5201,8 @@ function ChatViewContent(props: ChatViewProps) {
         timestampFormat={timestampFormat}
         mode="embedded"
       />
+    ) : activeRightPanelSurface?.kind === "subagents" ? (
+      <SubagentPanel tasks={subagentTasks} timestampFormat={timestampFormat} mode="embedded" />
     ) : (activeRightPanelSurface?.kind === "files" || activeRightPanelSurface?.kind === "file") &&
       activeProject &&
       activeWorkspaceRoot ? (
@@ -5263,6 +5293,7 @@ function ChatViewContent(props: ChatViewProps) {
               <MessagesTimeline
                 key={activeThread.id}
                 isWorking={isWorking}
+                waitingOnSubagentsCount={isWaitingOnSubagents ? openSubagentTasks.length : 0}
                 activeTurnInProgress={isWorking || !latestTurnSettled}
                 activeTurnStartedAt={activeWorkStartedAt}
                 listRef={legendListRef}

@@ -17,10 +17,12 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   RuntimeRequestId,
+  RuntimeTaskId,
   type RuntimeMode,
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
@@ -69,11 +71,18 @@ import { applyCursorAcpModelSelection, makeCursorAcpRuntime } from "../acp/Curso
 import {
   CursorAskQuestionRequest,
   CursorCreatePlanRequest,
+  CursorTaskRequest,
   CursorUpdateTodosRequest,
+  cursorSubagentTypeLabel,
   extractAskQuestions,
   extractPlanMarkdown,
   extractTodosAsPlan,
 } from "../acp/CursorAcpExtension.ts";
+import {
+  cursorAgentTranscriptsDir,
+  truncateSubagentSummary,
+  watchCursorSubagentTask,
+} from "../acp/CursorSubagentTranscripts.ts";
 import { type CursorAdapterShape } from "../Services/CursorAdapter.ts";
 import { resolveCursorAcpBaseModelId } from "./CursorProvider.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
@@ -111,6 +120,14 @@ export interface CursorAdapterLiveOptions {
    * the latest snapshot so the closure isn't stale.
    */
   readonly resolveSettings?: Effect.Effect<CursorSettings>;
+  /**
+   * Overrides for background-subagent transcript tracking. Tests shrink the
+   * intervals; production uses the defaults.
+   */
+  readonly subagentWatch?: {
+    readonly pollInterval?: import("effect/Duration").Input;
+    readonly matchTimeout?: import("effect/Duration").Input;
+  };
 }
 
 interface PendingApproval {
@@ -120,6 +137,12 @@ interface PendingApproval {
 
 interface PendingUserInput {
   readonly answers: Deferred.Deferred<ProviderUserInputAnswers>;
+}
+
+interface CursorSubagentTaskState {
+  readonly taskId: RuntimeTaskId;
+  readonly description: string;
+  readonly taskType: string | undefined;
 }
 
 interface CursorSessionContext {
@@ -138,6 +161,14 @@ interface CursorSessionContext {
    * continues it, and only the last remaining prompt settles the turn. */
   promptsInFlight: number;
   stopped: boolean;
+  /** Latest `rawOutput.isBackground` observed per Task tool call, so the
+   * `cursor/task` handler can tell background launches from foreground or
+   * resume settlements. */
+  readonly taskToolCallBackground: Map<string, boolean>;
+  /** Background subagent tasks that are still being tracked. */
+  readonly subagentTasks: Map<RuntimeTaskId, CursorSubagentTaskState>;
+  /** Transcript agent ids already claimed by a task watcher. */
+  readonly claimedSubagentIds: Set<string>;
 }
 
 function settlePendingApprovalsAsCancelled(
@@ -444,6 +475,164 @@ export function makeCursorAdapter(
         );
       });
 
+    const emitSubagentTaskCompleted = (
+      ctx: CursorSessionContext,
+      task: CursorSubagentTaskState,
+      payload: {
+        readonly status: "completed" | "failed" | "stopped";
+        readonly summary?: string;
+        readonly agentId?: string;
+      },
+      turnId: TurnId | undefined,
+    ) =>
+      Effect.flatMap(makeEventStamp(), (stamp) =>
+        offerRuntimeEvent({
+          type: "task.completed",
+          ...stamp,
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          ...(turnId ? { turnId } : {}),
+          payload: {
+            taskId: task.taskId,
+            status: payload.status,
+            description: task.description,
+            background: true,
+            ...(payload.summary ? { summary: payload.summary } : {}),
+            ...(payload.agentId ? { agentId: payload.agentId } : {}),
+          },
+        }),
+      );
+
+    // Emits task.started for a background subagent launch and follows the
+    // subagent's on-disk transcript for progress and completion. ACP itself
+    // sends nothing when a background subagent finishes, so the transcript is
+    // the only completion signal (see CursorSubagentTranscripts.ts).
+    const startSubagentTaskTracking = (
+      ctx: CursorSessionContext,
+      params: typeof CursorTaskRequest.Type,
+    ) =>
+      Effect.gen(function* () {
+        const taskId = RuntimeTaskId.make(params.toolCallId);
+        if (ctx.subagentTasks.has(taskId)) {
+          return;
+        }
+        const description = params.description?.trim() || "Subagent task";
+        const taskType = cursorSubagentTypeLabel(params.subagentType);
+        const task: CursorSubagentTaskState = { taskId, description, taskType };
+        const launchTurnId = ctx.activeTurnId;
+        ctx.subagentTasks.set(taskId, task);
+
+        yield* offerRuntimeEvent({
+          type: "task.started",
+          ...(yield* makeEventStamp()),
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          ...(launchTurnId ? { turnId: launchTurnId } : {}),
+          payload: {
+            taskId,
+            description,
+            ...(taskType ? { taskType } : {}),
+            background: true,
+          },
+          raw: {
+            source: "acp.cursor.extension",
+            method: "cursor/task",
+            payload: params,
+          },
+        });
+
+        const homeDir = options?.environment?.HOME ?? process.env.HOME;
+        const sessionCwd = ctx.session.cwd;
+        const prompt = params.prompt?.trim() ?? "";
+
+        const watch = Effect.gen(function* () {
+          if (!homeDir || !sessionCwd || prompt.length === 0) {
+            return { _tag: "MatchTimedOut" } as const;
+          }
+          return yield* watchCursorSubagentTask({
+            transcriptsDir: cursorAgentTranscriptsDir({
+              homeDir,
+              cwd: sessionCwd,
+              path,
+            }),
+            prompt,
+            launchedAtMillis: yield* Clock.currentTimeMillis,
+            claimedAgentIds: ctx.claimedSubagentIds,
+            ...(options?.subagentWatch?.pollInterval !== undefined
+              ? { pollInterval: options.subagentWatch.pollInterval }
+              : {}),
+            ...(options?.subagentWatch?.matchTimeout !== undefined
+              ? { matchTimeout: options.subagentWatch.matchTimeout }
+              : {}),
+            onProgress: (progress) =>
+              Effect.flatMap(makeEventStamp(), (stamp) =>
+                offerRuntimeEvent({
+                  type: "task.progress",
+                  ...stamp,
+                  provider: PROVIDER,
+                  threadId: ctx.threadId,
+                  ...(launchTurnId ? { turnId: launchTurnId } : {}),
+                  payload: {
+                    taskId,
+                    description,
+                    ...(progress.summary ? { summary: progress.summary } : {}),
+                    ...(progress.lastToolName ? { lastToolName: progress.lastToolName } : {}),
+                  },
+                }),
+              ).pipe(
+                Effect.catch((cause) =>
+                  Effect.logWarning("Failed to emit Cursor subagent progress.", { cause }),
+                ),
+              ),
+          });
+        });
+
+        yield* watch.pipe(
+          Effect.flatMap((result) =>
+            Effect.gen(function* () {
+              if (!ctx.subagentTasks.has(taskId)) {
+                // Already settled by session stop.
+                return;
+              }
+              ctx.subagentTasks.delete(taskId);
+              if (result._tag === "Completed") {
+                yield* emitSubagentTaskCompleted(
+                  ctx,
+                  task,
+                  {
+                    status: result.status,
+                    ...(result.finalText
+                      ? { summary: truncateSubagentSummary(result.finalText) }
+                      : {}),
+                    agentId: result.agentId,
+                  },
+                  launchTurnId,
+                );
+                return;
+              }
+              yield* Effect.logWarning("Cursor subagent transcript was never matched.", {
+                threadId: ctx.threadId,
+                taskId,
+              });
+              yield* emitSubagentTaskCompleted(
+                ctx,
+                task,
+                {
+                  status: "completed",
+                  summary:
+                    "T3 could not track this subagent's transcript. Check on the subagent manually (for example by resuming it with the Task tool).",
+                },
+                launchTurnId,
+              );
+            }),
+          ),
+          Effect.catch((cause) => Effect.logWarning("Cursor subagent tracking failed.", { cause })),
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+          Effect.forkIn(ctx.scope),
+        );
+      });
+
     const requireSession = (
       threadId: ThreadId,
     ): Effect.Effect<CursorSessionContext, ProviderAdapterSessionNotFoundError> => {
@@ -462,6 +651,25 @@ export function makeCursorAdapter(
         ctx.stopped = true;
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
+        // Watcher fibers die with the session scope below; settle their tasks
+        // first so the UI does not show subagents as running forever.
+        const orphanedTasks = Array.from(ctx.subagentTasks.values());
+        ctx.subagentTasks.clear();
+        for (const task of orphanedTasks) {
+          yield* offerRuntimeEvent({
+            type: "task.completed",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            payload: {
+              taskId: task.taskId,
+              status: "stopped",
+              description: task.description,
+              background: true,
+              summary: "The provider session stopped before this subagent finished.",
+            },
+          });
+        }
         if (ctx.notificationFiber) {
           yield* Fiber.interrupt(ctx.notificationFiber);
         }
@@ -663,6 +871,33 @@ export function makeCursorAdapter(
                   }),
                 ),
             );
+            const handleCursorTask = (params: typeof CursorTaskRequest.Type) =>
+              Effect.gen(function* () {
+                yield* logNative(input.threadId, "cursor/task", params, "acp.cursor.extension");
+                if (!ctx || ctx.stopped) {
+                  return;
+                }
+                // The Task tool_call_update carrying `rawOutput.isBackground`
+                // is routed off the same stdio pipe immediately before
+                // `cursor/task`; drain the parsed-event queue so the
+                // notification fiber has recorded it before we consult it.
+                yield* ctx.acp.drainEvents;
+                if (ctx.taskToolCallBackground.get(params.toolCallId) !== true) {
+                  // Foreground and resume settlements happen inside the turn;
+                  // the Task tool call already renders as a tool activity.
+                  return;
+                }
+                yield* startSubagentTaskTracking(ctx, params);
+              });
+            // Docs describe `cursor/task` as a notification, but cursor-agent
+            // sends it as a JSON-RPC request expecting an empty result.
+            // Register both shapes so either delivery works.
+            yield* acp.handleExtRequest("cursor/task", CursorTaskRequest, (params) =>
+              mapExtensionFailure(handleCursorTask(params).pipe(Effect.as({}))),
+            );
+            yield* acp.handleExtNotification("cursor/task", CursorTaskRequest, (params) =>
+              mapExtensionFailure(handleCursorTask(params)),
+            );
             yield* acp.handleRequestPermission((params) =>
               mapExtensionFailure(
                 Effect.gen(function* () {
@@ -780,6 +1015,9 @@ export function makeCursorAdapter(
             activeTurnId: undefined,
             promptsInFlight: 0,
             stopped: false,
+            taskToolCallBackground: new Map(),
+            subagentTasks: new Map(),
+            claimedSubagentIds: new Set(),
           };
 
           const nf = yield* Stream.runDrain(
@@ -830,7 +1068,14 @@ export function makeCursorAdapter(
                       "session/update",
                     );
                     return;
-                  case "ToolCallUpdated":
+                  case "ToolCallUpdated": {
+                    const rawOutput = event.toolCall.data.rawOutput;
+                    if (isRecord(rawOutput) && typeof rawOutput.isBackground === "boolean") {
+                      ctx.taskToolCallBackground.set(
+                        event.toolCall.toolCallId,
+                        rawOutput.isBackground,
+                      );
+                    }
                     yield* logNative(
                       ctx.threadId,
                       "session/update",
@@ -848,6 +1093,7 @@ export function makeCursorAdapter(
                       }),
                     );
                     return;
+                  }
                   case "ContentDelta":
                     yield* logNative(
                       ctx.threadId,

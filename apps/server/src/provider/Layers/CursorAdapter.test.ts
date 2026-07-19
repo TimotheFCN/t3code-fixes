@@ -1485,3 +1485,251 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
     },
   );
 });
+
+// The subagent-transcript watcher polls with real sleeps, so these tests run
+// on the live clock (the layered `it` above only exposes the TestClock-based
+// `it.effect`).
+const subagentTestEnvLayer = ServerConfig.layerTest(process.cwd(), {
+  prefix: "t3code-cursor-subagent-test-",
+}).pipe(Layer.provideMerge(NodeServices.layer));
+
+it.live("tracks cursor background subagents via cursor/task and transcripts", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("cursor-subagent-thread");
+    const taskPrompt = "Count the files in the repo for the subagent test.";
+    const home = yield* Effect.promise(() =>
+      NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "cursor-subagent-home-")),
+    );
+    const wrapperPath = yield* Effect.promise(() =>
+      makeMockAgentWrapper({
+        T3_ACP_EMIT_CURSOR_TASK: "1",
+        T3_ACP_CURSOR_TASK_PROMPT: taskPrompt,
+      }),
+    );
+    const adapter = yield* makeCursorAdapter(decodeCursorSettings({ binaryPath: wrapperPath }), {
+      environment: { HOME: home },
+      subagentWatch: { pollInterval: "20 millis", matchTimeout: "10 seconds" },
+    });
+
+    const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      Effect.sync(() => {
+        runtimeEvents.push(event);
+      }),
+    ).pipe(Effect.forkChild);
+
+    const waitForEvent = (predicate: (event: ProviderRuntimeEvent) => boolean) =>
+      Effect.gen(function* () {
+        for (let attempt = 0; attempt < 500; attempt += 1) {
+          const found = runtimeEvents.find(predicate);
+          if (found) {
+            return found;
+          }
+          yield* Effect.sleep("10 millis");
+        }
+        return yield* Effect.die(
+          `Timed out waiting for event. Seen: ${runtimeEvents.map((e) => e.type).join(", ")}`,
+        );
+      });
+
+    yield* adapter.startSession({
+      threadId,
+      provider: ProviderDriverKind.make("cursor"),
+      cwd: process.cwd(),
+      runtimeMode: "full-access",
+      modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+    });
+    const turn = yield* adapter.sendTurn({
+      threadId,
+      input: "launch a background subagent",
+      attachments: [],
+    });
+
+    const taskStarted = yield* waitForEvent((event) => event.type === "task.started");
+    assert.equal(taskStarted.type, "task.started");
+    if (taskStarted.type === "task.started") {
+      assert.equal(String(taskStarted.payload.taskId), "cursor-task-tool-call-1");
+      assert.equal(taskStarted.payload.description, "Mock subagent task");
+      assert.equal(taskStarted.payload.background, true);
+      assert.equal(String(taskStarted.turnId), String(turn.turnId));
+    }
+
+    // The main turn ends while the subagent keeps running.
+    yield* waitForEvent((event) => event.type === "turn.completed");
+    assert.isUndefined(runtimeEvents.find((event) => event.type === "task.completed"));
+
+    const transcriptsDir = NodePath.join(
+      home,
+      ".cursor",
+      "projects",
+      NodePath.resolve(process.cwd())
+        .replace(/^[/\\]+/, "")
+        .replace(/[/\\:]+/g, "-"),
+      "agent-transcripts",
+    );
+    const agentDir = NodePath.join(transcriptsDir, "real-agent-1");
+    const transcriptPath = NodePath.join(agentDir, "real-agent-1.jsonl");
+    // @effect-diagnostics-next-line preferSchemaOverJson:off
+    const userLine = JSON.stringify({
+      role: "user",
+      message: {
+        content: [{ type: "text", text: `<user_query>\n${taskPrompt}\n</user_query>` }],
+      },
+    });
+    // @effect-diagnostics-next-line preferSchemaOverJson:off
+    const progressLine = JSON.stringify({
+      role: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "Counting files now." },
+          { type: "tool_use", name: "Shell", input: { command: "ls" } },
+        ],
+      },
+    });
+    yield* Effect.promise(async () => {
+      await NodeFSP.mkdir(agentDir, { recursive: true });
+      await NodeFSP.writeFile(transcriptPath, [userLine, progressLine].join("\n"), "utf8");
+    });
+
+    const taskProgress = yield* waitForEvent((event) => event.type === "task.progress");
+    if (taskProgress.type === "task.progress") {
+      assert.equal(String(taskProgress.payload.taskId), "cursor-task-tool-call-1");
+      assert.equal(taskProgress.payload.summary, "Counting files now.");
+      assert.equal(taskProgress.payload.lastToolName, "Shell");
+    }
+
+    // @effect-diagnostics-next-line preferSchemaOverJson:off
+    const finalLine = JSON.stringify({
+      role: "assistant",
+      message: { content: [{ type: "text", text: "There are 42 files." }] },
+    });
+    // @effect-diagnostics-next-line preferSchemaOverJson:off
+    const endLine = JSON.stringify({ type: "turn_ended", status: "success" });
+    yield* Effect.promise(() =>
+      NodeFSP.writeFile(
+        transcriptPath,
+        [userLine, progressLine, finalLine, endLine].join("\n"),
+        "utf8",
+      ),
+    );
+
+    const taskCompleted = yield* waitForEvent((event) => event.type === "task.completed");
+    if (taskCompleted.type === "task.completed") {
+      assert.equal(String(taskCompleted.payload.taskId), "cursor-task-tool-call-1");
+      assert.equal(taskCompleted.payload.status, "completed");
+      assert.equal(taskCompleted.payload.background, true);
+      assert.equal(taskCompleted.payload.agentId, "real-agent-1");
+      assert.equal(taskCompleted.payload.summary, "There are 42 files.");
+      assert.equal(taskCompleted.payload.description, "Mock subagent task");
+    }
+
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.scoped, Effect.provide(subagentTestEnvLayer)),
+);
+
+it.live("settles tracked subagent tasks as stopped when the session stops", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("cursor-subagent-stop-thread");
+    const home = yield* Effect.promise(() =>
+      NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "cursor-subagent-stop-home-")),
+    );
+    const wrapperPath = yield* Effect.promise(() =>
+      makeMockAgentWrapper({
+        T3_ACP_EMIT_CURSOR_TASK: "1",
+        T3_ACP_CURSOR_TASK_PROMPT: "Never completes.",
+      }),
+    );
+    const adapter = yield* makeCursorAdapter(decodeCursorSettings({ binaryPath: wrapperPath }), {
+      environment: { HOME: home },
+      subagentWatch: { pollInterval: "20 millis", matchTimeout: "30 seconds" },
+    });
+
+    const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      Effect.sync(() => {
+        runtimeEvents.push(event);
+      }),
+    ).pipe(Effect.forkChild);
+
+    yield* adapter.startSession({
+      threadId,
+      provider: ProviderDriverKind.make("cursor"),
+      cwd: process.cwd(),
+      runtimeMode: "full-access",
+      modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+    });
+    yield* adapter.sendTurn({
+      threadId,
+      input: "launch a background subagent",
+      attachments: [],
+    });
+
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      if (runtimeEvents.some((event) => event.type === "task.started")) {
+        break;
+      }
+      yield* Effect.sleep("10 millis");
+    }
+    assert.isDefined(runtimeEvents.find((event) => event.type === "task.started"));
+
+    yield* adapter.stopSession(threadId);
+
+    const taskCompleted = runtimeEvents.find((event) => event.type === "task.completed");
+    assert.isDefined(taskCompleted);
+    if (taskCompleted?.type === "task.completed") {
+      assert.equal(taskCompleted.payload.status, "stopped");
+      assert.equal(taskCompleted.payload.background, true);
+    }
+  }).pipe(Effect.scoped, Effect.provide(subagentTestEnvLayer)),
+);
+
+it.live("ignores cursor/task settlements for foreground Task tool calls", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("cursor-subagent-foreground-thread");
+    const home = yield* Effect.promise(() =>
+      NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "cursor-subagent-fg-home-")),
+    );
+    const wrapperPath = yield* Effect.promise(() =>
+      makeMockAgentWrapper({
+        T3_ACP_EMIT_CURSOR_TASK: "1",
+        T3_ACP_CURSOR_TASK_IS_BACKGROUND: "0",
+      }),
+    );
+    const adapter = yield* makeCursorAdapter(decodeCursorSettings({ binaryPath: wrapperPath }), {
+      environment: { HOME: home },
+      subagentWatch: { pollInterval: "20 millis", matchTimeout: "1 second" },
+    });
+
+    const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      Effect.sync(() => {
+        runtimeEvents.push(event);
+      }),
+    ).pipe(Effect.forkChild);
+
+    yield* adapter.startSession({
+      threadId,
+      provider: ProviderDriverKind.make("cursor"),
+      cwd: process.cwd(),
+      runtimeMode: "full-access",
+      modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+    });
+    yield* adapter.sendTurn({
+      threadId,
+      input: "run a foreground subagent",
+      attachments: [],
+    });
+
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (runtimeEvents.some((event) => event.type === "turn.completed")) {
+        break;
+      }
+      yield* Effect.sleep("10 millis");
+    }
+    assert.isDefined(runtimeEvents.find((event) => event.type === "turn.completed"));
+    assert.isUndefined(runtimeEvents.find((event) => event.type === "task.started"));
+    assert.isUndefined(runtimeEvents.find((event) => event.type === "task.completed"));
+
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.scoped, Effect.provide(subagentTestEnvLayer)),
+);

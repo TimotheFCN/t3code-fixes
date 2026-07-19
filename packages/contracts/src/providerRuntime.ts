@@ -463,6 +463,8 @@ const TaskStartedPayload = Schema.Struct({
   taskId: RuntimeTaskId,
   description: Schema.optional(TrimmedNonEmptyStringSchema),
   taskType: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** True when the task runs detached from the turn (e.g. Cursor background subagents). */
+  background: Schema.optional(Schema.Boolean),
 });
 export type TaskStartedPayload = typeof TaskStartedPayload.Type;
 
@@ -480,6 +482,11 @@ const TaskCompletedPayload = Schema.Struct({
   status: Schema.Literals(["completed", "failed", "stopped"]),
   summary: Schema.optional(TrimmedNonEmptyStringSchema),
   usage: Schema.optional(Schema.Unknown),
+  description: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** True when the task ran detached from the turn (e.g. Cursor background subagents). */
+  background: Schema.optional(Schema.Boolean),
+  /** Provider-side agent/conversation id usable to resume the subagent. */
+  agentId: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type TaskCompletedPayload = typeof TaskCompletedPayload.Type;
 

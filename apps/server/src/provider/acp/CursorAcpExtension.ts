@@ -54,6 +54,33 @@ export const CursorUpdateTodosRequest = Schema.Struct({
   merge: Schema.Boolean,
 });
 
+/**
+ * `cursor/task` — subagent task notification.
+ *
+ * Docs describe it as a fire-and-forget notification, but cursor-agent
+ * (observed on 2026.07.01) sends it as a JSON-RPC *request* that expects an
+ * empty result. It fires when the Task tool call settles: at spawn time for
+ * background launches (durationMs is the spawn duration) and at completion
+ * for foreground/resumed tasks.
+ *
+ * `subagentType` is documented as a string or `{ custom: string }` but is
+ * observed as nested objects like `{ custom: { unspecified: {} } }`, so it is
+ * kept unknown and normalized via {@link cursorSubagentTypeLabel}.
+ *
+ * `agentId` at background-launch time does NOT match the conversation id the
+ * subagent actually runs under (observed empirically); the real id is only
+ * discoverable from the on-disk transcript.
+ */
+export const CursorTaskRequest = Schema.Struct({
+  toolCallId: Schema.String,
+  description: Schema.optional(Schema.String),
+  prompt: Schema.optional(Schema.String),
+  subagentType: Schema.optional(Schema.Unknown),
+  model: Schema.optional(Schema.String),
+  agentId: Schema.optional(Schema.String),
+  durationMs: Schema.optional(Schema.Number),
+});
+
 const CursorAvailableModel = Schema.Struct({
   value: Schema.String,
   name: Schema.String,
@@ -84,6 +111,34 @@ export function extractAskQuestions(
 
 export function extractPlanMarkdown(params: typeof CursorCreatePlanRequest.Type): string {
   return params.plan || "# Plan\n\n(Cursor did not supply plan text.)";
+}
+
+/**
+ * Normalizes the loosely-typed `subagentType` field of `cursor/task` into a
+ * short label, e.g. `"explore"`, `"shell"`, or `undefined` when unspecified.
+ */
+export function cursorSubagentTypeLabel(subagentType: unknown): string | undefined {
+  const label = subagentTypeLabelRecursive(subagentType, 0);
+  return label === undefined || label === "unspecified" ? undefined : label;
+}
+
+function subagentTypeLabelRecursive(value: unknown, depth: number): string | undefined {
+  if (depth > 4) {
+    return undefined;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const entries = Object.entries(value);
+  if (entries.length !== 1) {
+    return undefined;
+  }
+  const [key, nested] = entries[0]!;
+  return subagentTypeLabelRecursive(nested, depth + 1) ?? (key.trim().length > 0 ? key : undefined);
 }
 
 export function extractTodosAsPlan(params: typeof CursorUpdateTodosRequest.Type): {
